@@ -1,0 +1,299 @@
+-- FTAP 板自動掴み v8
+-- v7から変更: REACT_DELAY = 0.1 のみ
+-- それ以外はv7と完全に同じ
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local VirtualUser = game:GetService("VirtualUser")
+local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
+local LP = Players.LocalPlayer
+
+local parent = LP:FindFirstChildOfClass("PlayerGui") or game:GetService("CoreGui")
+
+for _, g in ipairs(parent:GetChildren()) do
+    if g:IsA("ScreenGui") and g.Name:find("FTAPBoardGrab") then
+        pcall(function() g:Destroy() end)
+    end
+end
+task.wait(0.1)
+
+-- ==================== 設定 ====================
+local CONFIG = {
+    FACE_DURATION  = 0.08,
+    SPAWN_RANGE    = 30,
+    PLATE_MAX_DIM  = 15,
+    PLATE_MIN_DIM  = 0.3,
+    PLATE_RATIO    = 2.5,
+    COOLDOWN       = 1.0,
+    REACT_DELAY    = 0.1,  -- ★ v7の0.2 → 0.1
+}
+
+-- ==================== 状態 ====================
+local enabled = false
+local running = false
+local myPlate = nil
+local lastAction = 0
+
+-- ==================== 板判定 ====================
+local function looksLikePlate(p)
+    if not p or not p:IsA("BasePart") then return false end
+    local sz = p.Size
+    local maxD = math.max(sz.X, sz.Y, sz.Z)
+    local minD = math.min(sz.X, sz.Y, sz.Z)
+    if maxD > CONFIG.PLATE_MAX_DIM then return false end
+    if minD < CONFIG.PLATE_MIN_DIM then return false end
+    return (maxD / minD) >= CONFIG.PLATE_RATIO
+end
+
+local function myRoot()
+    local char = LP.Character
+    if not char then return nil end
+    return char:FindFirstChild("HumanoidRootPart")
+end
+
+-- ==================== 掴み中判定 ====================
+local function isHolding()
+    local char = LP.Character
+    if not char then return false end
+    if char:FindFirstChildOfClass("Tool") then return true end
+    for _, d in ipairs(char:GetChildren()) do
+        if d:IsA("Weld") or d:IsA("WeldConstraint") then
+            local p0 = d.Part0
+            local p1 = d.Part1
+            if p0 and p1 then
+                local in0 = p0:IsDescendantOf(char)
+                local in1 = p1:IsDescendantOf(char)
+                if not (in0 and in1) then return true end
+            end
+        end
+    end
+    return false
+end
+
+-- ==================== 板を向く ====================
+local function snapFace(p)
+    local char = LP.Character
+    local root = myRoot()
+    if not char or not root or not p then return end
+    local target = Vector3.new(p.Position.X, root.Position.Y, p.Position.Z)
+    local goal = CFrame.lookAt(root.Position, target)
+    local start = root.CFrame
+    local t0 = tick()
+    while tick() - t0 < CONFIG.FACE_DURATION do
+        if not enabled then return end
+        local a = math.clamp((tick() - t0) / CONFIG.FACE_DURATION, 0, 1)
+        root.CFrame = start:Lerp(goal, a)
+        RunService.RenderStepped:Wait()
+    end
+    root.CFrame = goal
+    local cam = workspace.CurrentCamera
+    if cam then cam.CFrame = CFrame.lookAt(cam.CFrame.Position, p.Position) end
+end
+
+-- ==================== 掴み ====================
+local function tryPrompt(p)
+    for _, d in ipairs(p:GetChildren()) do
+        if d:IsA("ProximityPrompt") then
+            pcall(function()
+                d:InputHoldBegin()
+                task.wait(d.HoldDuration > 0 and d.HoldDuration or 0.1)
+                d:InputHoldEnd()
+            end)
+            return true
+        end
+    end
+    return false
+end
+
+local function tryClickDetector(p)
+    for _, d in ipairs(p:GetChildren()) do
+        if d:IsA("ClickDetector") then
+            pcall(function() fireclickdetector(d) end)
+            return true
+        end
+    end
+    return false
+end
+
+local function tryTouchTap()
+    local cam = workspace.CurrentCamera
+    if not cam then return false end
+    local vp = cam.ViewportSize
+    local center = Vector2.new(vp.X / 2, vp.Y / 2)
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton1(center)
+    end)
+    return true
+end
+
+local function tryVirtualTouch()
+    pcall(function()
+        local cam = workspace.CurrentCamera
+        if not cam then return end
+        local vp = cam.ViewportSize
+        local center = Vector2.new(vp.X / 2, vp.Y / 2)
+        UserInputService.TouchEnabled = true
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton1(center)
+    end)
+    return true
+end
+
+local function doGrab(p)
+    if tryPrompt(p) then return end
+    if tryClickDetector(p) then return end
+    tryTouchTap()
+    task.wait(0.05)
+    tryVirtualTouch()
+end
+
+-- ==================== 1回の掴み処理 ====================
+local function attemptOnce(plate)
+    if running then return end
+    if not enabled then return end
+    if not plate or not plate.Parent then return end
+    if tick() - lastAction < CONFIG.COOLDOWN then return end
+    if isHolding() then return end
+
+    running = true
+    lastAction = tick()
+
+    task.spawn(function()
+        snapFace(plate)
+        task.wait(0.05)
+        doGrab(plate)
+        running = false
+    end)
+end
+
+-- ==================== 出現検知 ====================
+workspace.DescendantAdded:Connect(function(d)
+    if not enabled then return end
+
+    local target = nil
+    if d:IsA("BasePart") then target = d
+    elseif d:IsA("Model") then target = d:FindFirstChildWhichIsA("BasePart")
+    end
+    if not target then return end
+    if target:IsDescendantOf(LP.Character) then return end
+    if not looksLikePlate(target) then return end
+
+    local root = myRoot()
+    if not root then return end
+    local dist = (target.Position - root.Position).Magnitude
+    if dist > CONFIG.SPAWN_RANGE then return end
+
+    myPlate = target
+
+    task.delay(CONFIG.REACT_DELAY, function()
+        if not enabled then return end
+        if not target.Parent then return end
+        attemptOnce(target)
+    end)
+end)
+
+workspace.DescendantRemoving:Connect(function(d)
+    if myPlate == d then myPlate = nil end
+    if myPlate and myPlate:IsDescendantOf(d) then myPlate = nil end
+end)
+
+-- ==================== スマホ判定を強制 ====================
+pcall(function()
+    UserInputService.TouchEnabled = true
+    UserInputService.MouseEnabled = false
+    UserInputService.KeyboardEnabled = false
+end)
+
+-- ==================== UI ====================
+local gui = Instance.new("ScreenGui")
+gui.Name = "FTAPBoardGrab"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 2147483647
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+gui.Enabled = true
+gui.Parent = parent
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.fromOffset(190, 80)
+frame.Position = UDim2.new(0, 10, 0, 10)
+frame.BackgroundColor3 = Color3.fromRGB(18, 18, 28)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Draggable = true
+frame.ZIndex = 1
+frame.Parent = gui
+local fc = Instance.new("UICorner"); fc.CornerRadius = UDim.new(0, 10); fc.Parent = frame
+local stroke = Instance.new("UIStroke"); stroke.Color = Color3.fromRGB(100, 180, 255); stroke.Thickness = 2; stroke.Parent = frame
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 24)
+title.BackgroundColor3 = Color3.fromRGB(35, 60, 100)
+title.BorderSizePixel = 0
+title.Text = "板 自動掴み v8"
+title.TextColor3 = Color3.fromRGB(220, 240, 255)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 12
+title.ZIndex = 2
+title.Parent = frame
+local tc = Instance.new("UICorner"); tc.CornerRadius = UDim.new(0, 10); tc.Parent = title
+
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Size = UDim2.new(1, -14, 0, 30)
+toggleBtn.Position = UDim2.new(0, 7, 0, 30)
+toggleBtn.BackgroundColor3 = Color3.fromRGB(150, 40, 40)
+toggleBtn.Text = "OFF"
+toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+toggleBtn.Font = Enum.Font.GothamBold
+toggleBtn.TextSize = 14
+toggleBtn.BorderSizePixel = 0
+toggleBtn.Active = true
+toggleBtn.Selectable = true
+toggleBtn.ZIndex = 3
+toggleBtn.Parent = frame
+local tbc = Instance.new("UICorner"); tbc.CornerRadius = UDim.new(0, 6); tbc.Parent = toggleBtn
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -14, 0, 14)
+status.Position = UDim2.new(0, 7, 0, 62)
+status.BackgroundTransparency = 1
+status.TextColor3 = Color3.fromRGB(180, 220, 180)
+status.Font = Enum.Font.Code
+status.TextSize = 10
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.Text = "idle"
+status.ZIndex = 3
+status.Parent = frame
+
+task.spawn(function()
+    while true do
+        task.wait(0.3)
+        if not enabled then
+            status.Text = "idle"
+        elseif running then
+            status.Text = "反応中"
+        elseif myPlate and myPlate.Parent then
+            status.Text = "板あり"
+        else
+            status.Text = "待機"
+        end
+    end
+end)
+
+toggleBtn.MouseButton1Click:Connect(function()
+    enabled = not enabled
+    if enabled then
+        toggleBtn.Text = "ON"
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(40, 160, 80)
+        myPlate = nil
+        running = false
+    else
+        toggleBtn.Text = "OFF"
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(150, 40, 40)
+        myPlate = nil
+    end
+end)
+
+print("[BoardGrab v8] 起動")
